@@ -518,25 +518,35 @@ setInterval(() => {
 }, HEARTBEAT_INTERVAL);
 
 // Start server
-try {
-  httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ WebSocket server running on port ${PORT}`);
-    console.log(`✅ Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`✅ CORS origin: ${CORS_ORIGIN}`);
-    console.log(`✅ Health check: http://0.0.0.0:${PORT}/health`);
-  });
+const startServer = () => {
+  try {
+    httpServer.on('listening', () => {
+      const address = httpServer.address();
+      console.log(`✅ WebSocket server running on port ${PORT}`);
+      console.log(`✅ Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`✅ CORS origin: ${CORS_ORIGIN}`);
+      console.log(`✅ Health check: http://0.0.0.0:${PORT}/health`);
+      console.log(`✅ Server address: ${JSON.stringify(address)}`);
+    });
 
-  httpServer.on('error', (err) => {
-    console.error('❌ Server error:', err);
-    if (err.code === 'EADDRINUSE') {
-      console.error(`❌ Port ${PORT} is already in use`);
-    }
-  });
+    httpServer.on('error', (err) => {
+      console.error('❌ Server error:', err);
+      if (err.code === 'EADDRINUSE') {
+        console.error(`❌ Port ${PORT} is already in use`);
+      }
+      process.exit(1);
+    });
 
-} catch (error) {
-  console.error('❌ Failed to start server:', error);
-  process.exit(1);
-}
+    httpServer.listen(PORT, '0.0.0.0');
+
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+};
+
+// Start the server
+startServer();
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
