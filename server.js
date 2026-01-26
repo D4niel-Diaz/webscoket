@@ -186,6 +186,9 @@ io.on('connection', (socket) => {
   // Handle join presence pool
   socket.on('presence:join', () => {
     console.log(`Guest ${guestId} joined presence pool`);
+    
+    // Remove from pool first to prevent duplicates
+    presencePool.delete(guestId);
     presencePool.add(guestId);
 
     // Try to match
@@ -408,19 +411,30 @@ io.on('connection', (socket) => {
 
 // Matching logic
 function tryMatch(guestId) {
-  // Find a partner (first available guest that's not self)
+  // Remove current guest from pool first to prevent self-matching
+  presencePool.delete(guestId);
+  
+  // Find a partner (first available guest)
   const pool = Array.from(presencePool);
-  const partnerId = pool.find(id => id !== guestId);
+  const partnerId = pool[0]; // Get first available guest
 
   if (!partnerId) {
-    console.log(`No match found for ${guestId}`);
+    console.log(`No match found for ${guestId} - waiting for another user`);
+    // Add back to pool if no partner found
+    presencePool.add(guestId);
+    return;
+  }
+
+  // Ensure partner is not the same as current guest (double-check)
+  if (partnerId === guestId) {
+    console.error(`Self-matching detected for ${guestId}, removing from pool`);
+    presencePool.delete(guestId);
     return;
   }
 
   console.log(`Matching ${guestId} with ${partnerId}`);
 
-  // Remove both from pool
-  presencePool.delete(guestId);
+  // Remove partner from pool
   presencePool.delete(partnerId);
 
   // Create chat via Laravel
