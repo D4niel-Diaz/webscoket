@@ -26,17 +26,14 @@ const HEARTBEAT_INTERVAL = parseInt(process.env.HEARTBEAT_INTERVAL || '30000', 1
 
 // Create HTTP server with health check
 const httpServer = createServer((req, res) => {
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'ok',
-      timestamp: new Date().toISOString(),
-      connections: connectedGuests.size
-    }));
-  } else {
-    res.writeHead(404);
-    res.end('Not Found');
-  }
+  // Handle all requests with a simple response
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    status: 'ok',
+    service: 'websocket-server',
+    timestamp: new Date().toISOString(),
+    connections: connectedGuests.size
+  }));
 });
 
 // Create Socket.IO server with production-safe configuration
