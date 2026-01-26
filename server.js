@@ -506,7 +506,7 @@ setInterval(() => {
 }, HEARTBEAT_INTERVAL);
 
 // Start server
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`WebSocket server running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`CORS origin: ${CORS_ORIGIN}`);
