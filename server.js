@@ -24,8 +24,20 @@ const MESSAGE_RATE_WINDOW = parseInt(process.env.MESSAGE_RATE_WINDOW || '60000',
 const PRESENCE_TIMEOUT = parseInt(process.env.PRESENCE_TIMEOUT || '90000', 10);
 const HEARTBEAT_INTERVAL = parseInt(process.env.HEARTBEAT_INTERVAL || '30000', 10);
 
-// Create HTTP server
-const httpServer = createServer();
+// Create HTTP server with health check
+const httpServer = createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      connections: connectedGuests.size
+    }));
+  } else {
+    res.writeHead(404);
+    res.end('Not Found');
+  }
+});
 
 // Create Socket.IO server with production-safe configuration
 const io = new Server(httpServer, {
@@ -506,11 +518,25 @@ setInterval(() => {
 }, HEARTBEAT_INTERVAL);
 
 // Start server
-httpServer.listen(PORT, '0.0.0.0', () => {
-  console.log(`WebSocket server running on port ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`CORS origin: ${CORS_ORIGIN}`);
-});
+try {
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ WebSocket server running on port ${PORT}`);
+    console.log(`✅ Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`✅ CORS origin: ${CORS_ORIGIN}`);
+    console.log(`✅ Health check: http://0.0.0.0:${PORT}/health`);
+  });
+
+  httpServer.on('error', (err) => {
+    console.error('❌ Server error:', err);
+    if (err.code === 'EADDRINUSE') {
+      console.error(`❌ Port ${PORT} is already in use`);
+    }
+  });
+
+} catch (error) {
+  console.error('❌ Failed to start server:', error);
+  process.exit(1);
+}
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
