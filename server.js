@@ -516,14 +516,17 @@ setInterval(() => {
 
 // Start server
 const startServer = () => {
+  console.log('🚀 Starting WebSocket server...');
+  console.log(`📋 PORT: ${PORT}`);
+  console.log(`📋 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`📋 CORS Origin: ${CORS_ORIGIN}`);
+
   try {
     httpServer.on('listening', () => {
       const address = httpServer.address();
       console.log(`✅ WebSocket server running on port ${PORT}`);
-      console.log(`✅ Environment: ${process.env.NODE_ENV || 'development'}`);
-      console.log(`✅ CORS origin: ${CORS_ORIGIN}`);
-      console.log(`✅ Health check: http://0.0.0.0:${PORT}/health`);
       console.log(`✅ Server address: ${JSON.stringify(address)}`);
+      console.log(`✅ Health check: http://0.0.0.0:${PORT}/`);
     });
 
     httpServer.on('error', (err) => {
@@ -538,6 +541,7 @@ const startServer = () => {
 
   } catch (error) {
     console.error('❌ Failed to start server:', error);
+    console.error('Error stack:', error.stack);
     process.exit(1);
   }
 };
