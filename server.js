@@ -26,7 +26,11 @@ const HEARTBEAT_INTERVAL = parseInt(process.env.HEARTBEAT_INTERVAL || '30000', 1
 
 // Create HTTP server with health check
 const httpServer = createServer((req, res) => {
-  // Handle all requests with a simple response
+  // IMPORTANT: Don't intercept Socket.IO/Engine.IO handshake routes
+  if (req.url?.startsWith('/socket.io/')) {
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     status: 'ok',
@@ -45,33 +49,65 @@ const io = new Server(httpServer, {
   },
   pingTimeout: parseInt(process.env.PING_TIMEOUT || '60000', 10),
   pingInterval: parseInt(process.env.PING_INTERVAL || '25000', 10),
-  maxHttpBufferSize: parseInt(process.env.MAX_HTTP_BUFFER_SIZE || '1e6', 10),
+  maxHttpBufferSize: (() => {
+    const raw = process.env.MAX_HTTP_BUFFER_SIZE;
+    const val = raw ? Number(raw) : 1_000_000;
+    return Number.isFinite(val) && val > 0 ? val : 1_000_000;
+  })(),
   transports: ['websocket', 'polling'],
   allowUpgrades: true,
   upgradeTimeout: 10000
+});
+
+io.engine.on('connection_error', (err) => {
+  console.error('Engine.IO connection_error:', {
+    code: err.code,
+    message: err.message,
+    context: err.context
+  });
 });
 
 // In-memory storage (production should use Redis)
 const connectedGuests = new Map(); // guestId -> socket
 const chatRooms = new Map(); // chatId -> Set of guestIds
 const guestToChat = new Map(); // guestId -> chatId
-const presencePool = new Set(); // guestIds waiting for match
 const messageSequenceNumbers = new Map(); // chatId -> sequence number
 const pendingMessages = new Map(); // guestId -> array of pending messages
+const pendingMatchFound = new Map(); // guestId -> match payload
 const rateLimitTrackers = new Map(); // guestId -> { count, resetTime }
 const connectionCounts = new Map(); // ip -> count
 
 // Helper: Validate session token with Laravel backend
 async function validateSession(sessionToken) {
   try {
-    const response = await axios.get(`${LARAVEL_API_URL}/guest/refresh`, {
-      headers: { Authorization: `Bearer ${sessionToken}` },
-      timeout: 5000
-    });
-    return response.data.success;
+    const response = await axios.post(
+      `${LARAVEL_API_URL}/guest/refresh`,
+      null,
+      {
+        headers: { Authorization: `Bearer ${sessionToken}` },
+        timeout: 5000
+      }
+    );
+
+    if (!response.data?.success) {
+      return null;
+    }
+
+    return {
+      guestId: response.data?.data?.guest_id,
+    };
   } catch (error) {
-    return false;
+    return null;
   }
+}
+
+async function startChat(sessionToken) {
+  const response = await axios.post(
+    `${LARAVEL_API_URL}/chat/start`,
+    null,
+    { headers: { Authorization: `Bearer ${sessionToken}` }, timeout: 5000 }
+  );
+  return response.data;
 }
 
 // Helper: Send message via Laravel API for persistence
@@ -148,15 +184,19 @@ function getNextSequenceNumber(chatId) {
 io.use(async (socket, next) => {
   try {
     const sessionToken = socket.handshake.auth.token;
-    const guestId = socket.handshake.auth.guestId;
+    const claimedGuestId = socket.handshake.auth.guestId;
 
-    if (!sessionToken || !guestId) {
+    if (!sessionToken) {
       return next(new Error('Authentication failed: Missing credentials'));
     }
 
-    const isValid = await validateSession(sessionToken);
-    if (!isValid) {
+    const session = await validateSession(sessionToken);
+    if (!session?.guestId) {
       return next(new Error('Authentication failed: Invalid session'));
+    }
+
+    if (claimedGuestId && claimedGuestId !== session.guestId) {
+      return next(new Error('Authentication failed: Guest mismatch'));
     }
 
     // Check connection limit
@@ -166,7 +206,7 @@ io.use(async (socket, next) => {
     }
 
     socket.sessionToken = sessionToken;
-    socket.guestId = guestId;
+    socket.guestId = session.guestId;
     socket.ip = ip;
 
     incrementConnection(ip);
@@ -180,6 +220,8 @@ io.use(async (socket, next) => {
 io.on('connection', (socket) => {
   const { guestId, sessionToken, ip } = socket;
 
+  let matchRetryInterval = null;
+
   console.log(`Guest connected: ${guestId}`);
 
   // Store connection
@@ -192,30 +234,93 @@ io.on('connection', (socket) => {
     pendingMessages.delete(guestId);
   }
 
+  const pendingMatch = pendingMatchFound.get(guestId);
+  if (pendingMatch) {
+    socket.emit('match:found', pendingMatch);
+    pendingMatchFound.delete(guestId);
+  }
+
+  const stopMatchRetry = () => {
+    if (matchRetryInterval) {
+      clearInterval(matchRetryInterval);
+      matchRetryInterval = null;
+    }
+  };
+
+  const attemptMatch = async () => {
+    try {
+      const result = await startChat(sessionToken);
+      const data = result?.data;
+
+      if (!result?.success || !data?.status) {
+        return;
+      }
+
+      if (data.status !== 'matched' && data.status !== 'already_matched') {
+        return;
+      }
+
+      const chatId = Number(data.chat_id);
+      const partnerId = data.partner_id;
+
+      if (!chatId || !partnerId || partnerId === guestId) {
+        return;
+      }
+
+      stopMatchRetry();
+
+      const participants = new Set([guestId, partnerId]);
+      chatRooms.set(chatId, participants);
+      guestToChat.set(guestId, chatId);
+      guestToChat.set(partnerId, chatId);
+
+      const payloadForRequester = {
+        chat_id: chatId,
+        partner_id: partnerId,
+        started_at: data.started_at
+      };
+
+      const payloadForPartner = {
+        chat_id: chatId,
+        partner_id: guestId,
+        started_at: data.started_at
+      };
+
+      socket.emit('match:found', payloadForRequester);
+
+      const partnerSocket = connectedGuests.get(partnerId);
+      if (partnerSocket) {
+        partnerSocket.emit('match:found', payloadForPartner);
+      } else {
+        pendingMatchFound.set(partnerId, payloadForPartner);
+      }
+    } catch (e) {
+      // ignore transient failures
+    }
+  };
+
   // Handle join presence pool
   socket.on('presence:join', () => {
     console.log(`Guest ${guestId} joined presence pool`);
-    
-    // Remove from pool first to prevent duplicates
-    presencePool.delete(guestId);
-    presencePool.add(guestId);
 
-    // Try to match
-    tryMatch(guestId);
+    stopMatchRetry();
+    attemptMatch();
+    matchRetryInterval = setInterval(attemptMatch, parseInt(process.env.MATCH_RETRY_INTERVAL || '2000', 10));
   });
 
   // Handle leave presence pool
   socket.on('presence:leave', () => {
     console.log(`Guest ${guestId} left presence pool`);
-    presencePool.delete(guestId);
+    stopMatchRetry();
   });
 
   // Handle send message
   socket.on('message:send', async (data, callback) => {
     const { chatId, content } = data;
+    const normalizedChatId = Number(chatId);
 
     // Validate input
-    if (!chatId || !content || typeof content !== 'string') {
+    if (!normalizedChatId || !content || typeof content !== 'string') {
       if (callback) callback({ success: false, error: 'Invalid message data' });
       return;
     }
@@ -233,17 +338,17 @@ io.on('connection', (socket) => {
 
     // Verify guest is in this chat
     const currentChatId = guestToChat.get(guestId);
-    if (currentChatId !== chatId) {
+    if (currentChatId !== normalizedChatId) {
       if (callback) callback({ success: false, error: 'Not in this chat' });
       return;
     }
 
     try {
       // Get sequence number
-      const sequenceNumber = getNextSequenceNumber(chatId);
+      const sequenceNumber = getNextSequenceNumber(normalizedChatId);
 
       // Persist to database via Laravel
-      const persisted = await persistMessage(chatId, content, sessionToken);
+      const persisted = await persistMessage(normalizedChatId, content, sessionToken);
 
       // Create message object
       const message = {
@@ -256,7 +361,7 @@ io.on('connection', (socket) => {
       };
 
       // Get chat participants
-      const participants = chatRooms.get(chatId) || new Set();
+      const participants = chatRooms.get(normalizedChatId) || new Set();
       const partnerId = Array.from(participants).find(id => id !== guestId);
 
       // Send to partner if connected
@@ -284,12 +389,13 @@ io.on('connection', (socket) => {
   // Handle typing indicator
   socket.on('typing:start', (data) => {
     const { chatId } = data;
+    const normalizedChatId = Number(chatId);
 
     // Verify guest is in this chat
     const currentChatId = guestToChat.get(guestId);
-    if (currentChatId !== chatId) return;
+    if (currentChatId !== normalizedChatId) return;
 
-    const participants = chatRooms.get(chatId) || new Set();
+    const participants = chatRooms.get(normalizedChatId) || new Set();
     const partnerId = Array.from(participants).find(id => id !== guestId);
 
     if (partnerId) {
@@ -302,12 +408,13 @@ io.on('connection', (socket) => {
 
   socket.on('typing:stop', (data) => {
     const { chatId } = data;
+    const normalizedChatId = Number(chatId);
 
     // Verify guest is in this chat
     const currentChatId = guestToChat.get(guestId);
-    if (currentChatId !== chatId) return;
+    if (currentChatId !== normalizedChatId) return;
 
-    const participants = chatRooms.get(chatId) || new Set();
+    const participants = chatRooms.get(normalizedChatId) || new Set();
     const partnerId = Array.from(participants).find(id => id !== guestId);
 
     if (partnerId) {
@@ -321,27 +428,28 @@ io.on('connection', (socket) => {
   // Handle chat end
   socket.on('chat:end', async (data, callback) => {
     const { chatId } = data;
+    const normalizedChatId = Number(chatId);
 
     // Verify guest is in this chat
     const currentChatId = guestToChat.get(guestId);
-    if (currentChatId !== chatId) {
+    if (currentChatId !== normalizedChatId) {
       if (callback) callback({ success: false, error: 'Not in this chat' });
       return;
     }
 
     try {
       // Notify Laravel
-      await notifyChatEnd(chatId, sessionToken);
+      await notifyChatEnd(normalizedChatId, sessionToken);
 
       // Get participants
-      const participants = chatRooms.get(chatId) || new Set();
+      const participants = chatRooms.get(normalizedChatId) || new Set();
 
       // Notify both participants
       participants.forEach(participantId => {
         const participantSocket = connectedGuests.get(participantId);
         if (participantSocket) {
           participantSocket.emit('chat:ended', {
-            chat_id: chatId,
+            chat_id: normalizedChatId,
             ended_by: guestId,
             ended_at: new Date().toISOString()
           });
@@ -352,8 +460,8 @@ io.on('connection', (socket) => {
       });
 
       // Clean up room
-      chatRooms.delete(chatId);
-      messageSequenceNumbers.delete(chatId);
+      chatRooms.delete(normalizedChatId);
+      messageSequenceNumbers.delete(normalizedChatId);
 
       if (callback) callback({ success: true });
 
@@ -370,8 +478,7 @@ io.on('connection', (socket) => {
     // Decrement connection count
     decrementConnection(ip);
 
-    // Remove from presence pool
-    presencePool.delete(guestId);
+    stopMatchRetry();
 
     // Notify Laravel of disconnect
     axios.post(`${LARAVEL_API_URL}/presence/disconnect`, {}, {
@@ -399,10 +506,15 @@ io.on('connection', (socket) => {
         guestToChat.delete(partnerId);
       }
 
+      guestToChat.delete(guestId);
+
       // Clean up room
       chatRooms.delete(chatId);
       messageSequenceNumbers.delete(chatId);
     }
+
+    // Always remove guest->chat mapping (prevents stale state blocking future chats)
+    guestToChat.delete(guestId);
 
     // Remove connection
     connectedGuests.delete(guestId);
@@ -418,81 +530,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// Matching logic
-function tryMatch(guestId) {
-  // Remove current guest from pool first to prevent self-matching
-  presencePool.delete(guestId);
-  
-  // Find a partner (first available guest)
-  const pool = Array.from(presencePool);
-  const partnerId = pool[0]; // Get first available guest
-
-  if (!partnerId) {
-    console.log(`No match found for ${guestId} - waiting for another user`);
-    // Add back to pool if no partner found
-    presencePool.add(guestId);
-    return;
-  }
-
-  // Ensure partner is not the same as current guest (double-check)
-  if (partnerId === guestId) {
-    console.error(`Self-matching detected for ${guestId}, removing from pool`);
-    presencePool.delete(guestId);
-    return;
-  }
-
-  console.log(`Matching ${guestId} with ${partnerId}`);
-
-  // Remove partner from pool
-  presencePool.delete(partnerId);
-
-  // Create chat via Laravel
-  axios.post(`${LARAVEL_API_URL}/chat/start`, {}, {
-    headers: { Authorization: `Bearer ${connectedGuests.get(guestId).sessionToken}` },
-    timeout: 5000
-  }).then(response => {
-    const chatData = response.data.data;
-    const chatId = chatData.chat_id;
-
-    // Create room
-    const participants = new Set([guestId, partnerId]);
-    chatRooms.set(chatId, participants);
-
-    // Map guests to chat
-    guestToChat.set(guestId, chatId);
-    guestToChat.set(partnerId, chatId);
-
-    // Notify both guests
-    const guest1Socket = connectedGuests.get(guestId);
-    const guest2Socket = connectedGuests.get(partnerId);
-
-    if (guest1Socket) {
-      guest1Socket.emit('match:found', {
-        chat_id: chatId,
-        partner_id: partnerId,
-        started_at: chatData.started_at
-      });
-    }
-
-    if (guest2Socket) {
-      guest2Socket.emit('match:found', {
-        chat_id: chatId,
-        partner_id: guestId,
-        started_at: chatData.started_at
-      });
-    }
-
-    console.log(`Matched ${guestId} with ${partnerId} in chat ${chatId}`);
-
-  }).catch(error => {
-    console.error('Failed to create chat:', error.message);
-
-    // Return to pool
-    presencePool.add(guestId);
-    presencePool.add(partnerId);
-  });
-}
-
 // Heartbeat interval to clean up stale connections
 setInterval(() => {
   const now = Date.now();
@@ -500,7 +537,6 @@ setInterval(() => {
     if (!socket.connected) {
       console.log(`Cleaning up stale connection: ${guestId}`);
       connectedGuests.delete(guestId);
-      presencePool.delete(guestId);
       guestToChat.delete(guestId);
     }
   });
