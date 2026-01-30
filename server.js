@@ -16,13 +16,26 @@ const LARAVEL_API_URL = process.env.LARAVEL_API_URL || 'http://localhost:8000/ap
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173';
 
 // Rate limiting configuration
-const MAX_CONNECTIONS_PER_IP = parseInt(process.env.MAX_CONNECTIONS_PER_IP || '5', 10);
+// CRITICAL: Higher limit for development to allow multiple tabs/devices
+const MAX_CONNECTIONS_PER_IP = parseInt(process.env.MAX_CONNECTIONS_PER_IP || (process.env.NODE_ENV === 'production' ? '5' : '20'), 10);
 const MESSAGE_RATE_LIMIT = parseInt(process.env.MESSAGE_RATE_LIMIT || '10', 10);
 const MESSAGE_RATE_WINDOW = parseInt(process.env.MESSAGE_RATE_WINDOW || '60000', 10);
 
 // Presence settings
 const PRESENCE_TIMEOUT = parseInt(process.env.PRESENCE_TIMEOUT || '90000', 10);
 const HEARTBEAT_INTERVAL = parseInt(process.env.HEARTBEAT_INTERVAL || '30000', 10);
+
+// In-memory storage (production should use Redis)
+// CRITICAL: Declare before HTTP server to avoid reference errors
+const connectedGuests = new Map(); // guestId -> socket
+const chatRooms = new Map(); // chatId -> Set of guestIds
+const guestToChat = new Map(); // guestId -> chatId
+const messageSequenceNumbers = new Map(); // chatId -> sequence number
+const pendingMessages = new Map(); // guestId -> array of pending messages
+const pendingMatchFound = new Map(); // guestId -> match payload
+const rateLimitTrackers = new Map(); // guestId -> { count, resetTime }
+const connectionCounts = new Map(); // ip -> count
+const connectionAttempts = new Map(); // ip -> { count, resetTime } for auth rate limiting
 
 // Create HTTP server with health check
 const httpServer = createServer((req, res) => {
@@ -40,10 +53,47 @@ const httpServer = createServer((req, res) => {
   }));
 });
 
+// Parse CORS origins - support multiple origins and wildcards
+const getCorsOriginChecker = () => {
+  const origins = process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',').map(o => o.trim()) : [CORS_ORIGIN];
+  
+  // Add Vercel patterns for production
+  if (process.env.NODE_ENV === 'production') {
+    origins.push('https://sochat-*.vercel.app', 'https://*.vercel.app');
+  }
+  
+  return (origin, callback) => {
+    // Allow requests with no origin (mobile apps, Postman, etc.)
+    if (!origin) return callback(null, true);
+    
+    // Check exact matches
+    if (origins.includes(origin)) {
+      return callback(null, true);
+    }
+    
+    // Check wildcard patterns
+    for (const pattern of origins) {
+      if (pattern.includes('*')) {
+        const regex = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$');
+        if (regex.test(origin)) {
+          return callback(null, true);
+        }
+      }
+    }
+    
+    // Default: allow in development, deny in production
+    if (process.env.NODE_ENV !== 'production') {
+      return callback(null, true);
+    }
+    
+    callback(new Error('Not allowed by CORS'));
+  };
+};
+
 // Create Socket.IO server with production-safe configuration
 const io = new Server(httpServer, {
   cors: {
-    origin: CORS_ORIGIN,
+    origin: getCorsOriginChecker(),
     methods: ['GET', 'POST'],
     credentials: true
   },
@@ -66,16 +116,6 @@ io.engine.on('connection_error', (err) => {
     context: err.context
   });
 });
-
-// In-memory storage (production should use Redis)
-const connectedGuests = new Map(); // guestId -> socket
-const chatRooms = new Map(); // chatId -> Set of guestIds
-const guestToChat = new Map(); // guestId -> chatId
-const messageSequenceNumbers = new Map(); // chatId -> sequence number
-const pendingMessages = new Map(); // guestId -> array of pending messages
-const pendingMatchFound = new Map(); // guestId -> match payload
-const rateLimitTrackers = new Map(); // guestId -> { count, resetTime }
-const connectionCounts = new Map(); // ip -> count
 
 // Helper: Validate session token with Laravel backend
 async function validateSession(sessionToken) {
@@ -157,7 +197,32 @@ function checkRateLimit(guestId) {
 // Helper: Check connection limit per IP
 function checkConnectionLimit(ip) {
   const count = connectionCounts.get(ip) || 0;
-  return count < MAX_CONNECTIONS_PER_IP;
+  const allowed = count < MAX_CONNECTIONS_PER_IP;
+  
+  if (!allowed) {
+    console.warn(`Connection limit exceeded for IP ${ip}: ${count}/${MAX_CONNECTIONS_PER_IP}`);
+  }
+  
+  return allowed;
+}
+
+// Helper: Check authentication rate limit
+function checkAuthRateLimit(ip) {
+  const now = Date.now();
+  const AUTH_RATE_LIMIT = 10; // Max 10 auth attempts
+  const AUTH_RATE_WINDOW = 60000; // Per minute
+  
+  const tracker = connectionAttempts.get(ip) || { count: 0, resetTime: now + AUTH_RATE_WINDOW };
+  
+  if (now > tracker.resetTime) {
+    tracker.count = 0;
+    tracker.resetTime = now + AUTH_RATE_WINDOW;
+  }
+  
+  tracker.count++;
+  connectionAttempts.set(ip, tracker);
+  
+  return tracker.count <= AUTH_RATE_LIMIT;
 }
 
 // Helper: Increment connection count
@@ -172,17 +237,28 @@ function decrementConnection(ip) {
   connectionCounts.set(ip, Math.max(0, count - 1));
 }
 
-// Helper: Get next sequence number for chat
+// Helper: Get next sequence number for chat (atomic operation)
 function getNextSequenceNumber(chatId) {
+  // Use atomic increment to prevent race conditions
   const current = messageSequenceNumbers.get(chatId) || 0;
   const next = current + 1;
   messageSequenceNumbers.set(chatId, next);
   return next;
 }
 
+// CRITICAL: Ensure sequence numbers are unique per chat
+// In production, this should use Redis INCR for true atomicity
+
 // Middleware: Authentication
 io.use(async (socket, next) => {
   try {
+    const ip = socket.handshake.address;
+    
+    // CRITICAL: Rate limit authentication attempts
+    if (!checkAuthRateLimit(ip)) {
+      return next(new Error('Too many authentication attempts. Please try again later.'));
+    }
+    
     const sessionToken = socket.handshake.auth.token;
     const claimedGuestId = socket.handshake.auth.guestId;
 
@@ -200,9 +276,8 @@ io.use(async (socket, next) => {
     }
 
     // Check connection limit
-    const ip = socket.handshake.address;
     if (!checkConnectionLimit(ip)) {
-      return next(new Error('Too many connections from this IP'));
+      return next(new Error(`Too many connections from this IP (max ${MAX_CONNECTIONS_PER_IP}). Please close other tabs or wait a moment.`));
     }
 
     socket.sessionToken = sessionToken;
@@ -425,6 +500,44 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Handle chat rejoin (after reconnection)
+  socket.on('chat:rejoin', async (data) => {
+    const { chatId } = data;
+    const normalizedChatId = Number(chatId);
+
+    if (!normalizedChatId) {
+      warn(`Invalid chat rejoin request from ${guestId}`);
+      return;
+    }
+
+    // Verify guest is in this chat
+    const currentChatId = guestToChat.get(guestId);
+    if (currentChatId !== normalizedChatId) {
+      // Try to restore from backend
+      try {
+        const response = await axios.get(
+          `${LARAVEL_API_URL}/chat/${normalizedChatId}/messages`,
+          { headers: { Authorization: `Bearer ${sessionToken}` }, timeout: 5000 }
+        );
+        
+        if (response.data?.success) {
+          // Restore chat room membership
+          const participants = chatRooms.get(normalizedChatId) || new Set();
+          participants.add(guestId);
+          chatRooms.set(normalizedChatId, participants);
+          guestToChat.set(guestId, normalizedChatId);
+          
+          console.log(`Guest ${guestId} rejoined chat ${normalizedChatId}`);
+        }
+      } catch (error) {
+        console.error(`Failed to rejoin chat ${normalizedChatId}:`, error.message);
+      }
+    } else {
+      // Already in chat, just confirm
+      console.log(`Guest ${guestId} already in chat ${normalizedChatId}`);
+    }
+  });
+
   // Handle chat end
   socket.on('chat:end', async (data, callback) => {
     const { chatId } = data;
@@ -475,8 +588,12 @@ io.on('connection', (socket) => {
   socket.on('disconnect', (reason) => {
     console.log(`Guest disconnected: ${guestId}, reason: ${reason}`);
 
-    // Decrement connection count
+    // CRITICAL: Always decrement connection count on disconnect FIRST
+    // This must happen before any other cleanup to prevent connection limit issues
     decrementConnection(ip);
+    
+    // Remove from connected guests immediately to prevent stale connections
+    connectedGuests.delete(guestId);
 
     stopMatchRetry();
 
@@ -516,8 +633,7 @@ io.on('connection', (socket) => {
     // Always remove guest->chat mapping (prevents stale state blocking future chats)
     guestToChat.delete(guestId);
 
-    // Remove connection
-    connectedGuests.delete(guestId);
+    // Connection already removed above
   });
 
   // Handle reconnection
@@ -536,6 +652,13 @@ setInterval(() => {
   connectedGuests.forEach((socket, guestId) => {
     if (!socket.connected) {
       console.log(`Cleaning up stale connection: ${guestId}`);
+      const ip = socket.ip;
+      
+      // Decrement connection count for this IP
+      if (ip) {
+        decrementConnection(ip);
+      }
+      
       connectedGuests.delete(guestId);
       guestToChat.delete(guestId);
     }
@@ -545,6 +668,13 @@ setInterval(() => {
   rateLimitTrackers.forEach((tracker, guestId) => {
     if (now > tracker.resetTime) {
       rateLimitTrackers.delete(guestId);
+    }
+  });
+
+  // Clean up connection attempt trackers
+  connectionAttempts.forEach((tracker, ip) => {
+    if (now > tracker.resetTime) {
+      connectionAttempts.delete(ip);
     }
   });
 
