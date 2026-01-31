@@ -363,16 +363,24 @@ io.use(async (socket, next) => {
   }
 });
 
-// Connection handler
-io.on('connection', (socket) => {
-  const { guestId, sessionToken, ip } = socket;
+  // Connection handler
+  io.on('connection', (socket) => {
+    const { guestId, sessionToken, ip } = socket;
 
-  let matchRetryInterval = null;
+    let matchRetryInterval = null;
 
-  console.log(`Guest connected: ${guestId}`);
+    console.log(`Guest connected: ${guestId}`);
 
-  // Store connection
-  connectedGuests.set(guestId, socket);
+    // Store connection
+    connectedGuests.set(guestId, socket);
+
+    // CRITICAL: Mark user as online in Laravel backend
+    axios.post(`${LARAVEL_API_URL}/presence/heartbeat`, {}, {
+      headers: { Authorization: `Bearer ${sessionToken}` },
+      timeout: 5000
+    }).catch(err => {
+      console.error(`Failed to mark ${guestId} as online:`, err.message);
+    });
 
   // Send pending messages
   const pending = pendingMessages.get(guestId) || [];
