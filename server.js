@@ -59,7 +59,13 @@ const getCorsOriginChecker = () => {
   
   // Add Vercel patterns for production
   if (process.env.NODE_ENV === 'production') {
-    origins.push('https://sochat-*.vercel.app', 'https://*.vercel.app');
+    origins.push(
+      'https://sochat-frontend.vercel.app',
+      'https://sochat-livid.vercel.app',
+      'https://sochat-git-main-daniels-projects-8c2bbb7b.vercel.app',
+      'https://sochat-*.vercel.app',
+      'https://*.vercel.app'
+    );
   }
   
   return (origin, callback) => {
@@ -86,6 +92,8 @@ const getCorsOriginChecker = () => {
       return callback(null, true);
     }
     
+    // Log rejected origin for debugging
+    console.warn(`CORS rejected origin: ${origin}`);
     callback(new Error('Not allowed by CORS'));
   };
 };
@@ -120,23 +128,61 @@ io.engine.on('connection_error', (err) => {
 // Helper: Validate session token with Laravel backend
 async function validateSession(sessionToken) {
   try {
+    if (!sessionToken || typeof sessionToken !== 'string' || sessionToken.length < 10) {
+      console.error('❌ Invalid session token format:', sessionToken ? `${sessionToken.substring(0, 10)}...` : 'null');
+      return null;
+    }
+
     const response = await axios.post(
       `${LARAVEL_API_URL}/guest/refresh`,
       null,
       {
         headers: { Authorization: `Bearer ${sessionToken}` },
-        timeout: 5000
+        timeout: 10000 // Increased from 5s to 10s
       }
     );
 
     if (!response.data?.success) {
+      console.error('❌ Session validation failed - backend returned success=false:', {
+        status: response.status,
+        data: response.data
+      });
+      return null;
+    }
+
+    if (!response.data?.data?.guest_id) {
+      console.error('❌ Session validation failed - missing guest_id in response:', response.data);
       return null;
     }
 
     return {
-      guestId: response.data?.data?.guest_id,
+      guestId: response.data.data.guest_id,
     };
   } catch (error) {
+    // CRITICAL: Log detailed error information for debugging
+    if (error.response) {
+      // Backend responded with error status
+      console.error('❌ Session validation failed - backend error:', {
+        status: error.response.status,
+        statusText: error.response.statusText,
+        data: error.response.data,
+        url: `${LARAVEL_API_URL}/guest/refresh`
+      });
+    } else if (error.request) {
+      // Request was made but no response received
+      console.error('❌ Session validation failed - no response from backend:', {
+        message: error.message,
+        code: error.code,
+        url: `${LARAVEL_API_URL}/guest/refresh`,
+        hint: 'Is the Laravel backend running?'
+      });
+    } else {
+      // Error setting up request
+      console.error('❌ Session validation failed - request setup error:', {
+        message: error.message,
+        url: `${LARAVEL_API_URL}/guest/refresh`
+      });
+    }
     return null;
   }
 }
@@ -259,19 +305,39 @@ io.use(async (socket, next) => {
       return next(new Error('Too many authentication attempts. Please try again later.'));
     }
     
-    const sessionToken = socket.handshake.auth.token;
-    const claimedGuestId = socket.handshake.auth.guestId;
+    const sessionToken = socket.handshake.auth?.token;
+    const claimedGuestId = socket.handshake.auth?.guestId;
 
     if (!sessionToken) {
+      console.error('❌ Authentication failed: Missing session token', {
+        ip,
+        hasAuth: !!socket.handshake.auth,
+        authKeys: socket.handshake.auth ? Object.keys(socket.handshake.auth) : []
+      });
       return next(new Error('Authentication failed: Missing credentials'));
     }
 
+    console.log('🔐 Validating session token...', {
+      tokenPrefix: sessionToken.substring(0, 10) + '...',
+      claimedGuestId,
+      backendUrl: LARAVEL_API_URL
+    });
+
     const session = await validateSession(sessionToken);
     if (!session?.guestId) {
-      return next(new Error('Authentication failed: Invalid session'));
+      console.error('❌ Authentication failed: Session validation returned null', {
+        ip,
+        tokenPrefix: sessionToken.substring(0, 10) + '...',
+        backendUrl: LARAVEL_API_URL
+      });
+      return next(new Error('Authentication failed: Invalid session. Please refresh the page to get a new session.'));
     }
 
     if (claimedGuestId && claimedGuestId !== session.guestId) {
+      console.error('❌ Authentication failed: Guest ID mismatch', {
+        claimed: claimedGuestId,
+        validated: session.guestId
+      });
       return next(new Error('Authentication failed: Guest mismatch'));
     }
 
@@ -284,10 +350,16 @@ io.use(async (socket, next) => {
     socket.guestId = session.guestId;
     socket.ip = ip;
 
+    console.log('✅ Authentication successful', {
+      guestId: session.guestId,
+      ip
+    });
+
     incrementConnection(ip);
     next();
   } catch (error) {
-    next(new Error('Authentication failed'));
+    console.error('❌ Authentication error:', error.message, error.stack);
+    next(new Error('Authentication failed: ' + error.message));
   }
 });
 
@@ -692,7 +764,10 @@ const startServer = () => {
       const address = httpServer.address();
       console.log(`✅ WebSocket server running on port ${PORT}`);
       console.log(`✅ Server address: ${JSON.stringify(address)}`);
-      console.log(`✅ Health check: http://0.0.0.0:${PORT}/`);
+      // CRITICAL: 0.0.0.0 is a bind address, not accessible from browser
+      // Show localhost instead for health check access
+      console.log(`✅ Health check: http://localhost:${PORT}/`);
+      console.log(`   (Also accessible at: http://127.0.0.1:${PORT}/)`);
     });
 
     httpServer.on('error', (err) => {
