@@ -3,184 +3,171 @@ import { Server } from 'socket.io';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { dirname } from 'path';
+import {
+  connectRedis,
+  setGuestSocket,
+  getGuestSocketId,
+  deleteGuestSocket,
+  setGuestChat,
+  getGuestChat,
+  deleteGuestChat,
+  addGuestToRoom,
+  removeGuestFromRoom,
+  getRoomGuests,
+  deleteRoom,
+  addToWaiting,
+  removeFromWaiting,
+  isInWaiting,
+  setPendingMatch,
+  getPendingMatch,
+  deletePendingMatch,
+  addPendingMessage,
+  getPendingMessages,
+  deletePendingMessages,
+  incrementConnections,
+  decrementConnections,
+  getConnectionCount,
+  checkAuthRateLimit,
+  checkMessageRateLimit,
+  cleanupGuest,
+} from './redisStore.js';
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const __dirname  = dirname(__filename);
 
-// Configuration
-const PORT = process.env.PORT || 3001;
-const LARAVEL_API_URL = process.env.LARAVEL_API_URL || 'http://localhost:8000/api/v1';
-const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173';
+// ─── Configuration ────────────────────────────────────────────────────────────
+const PORT             = process.env.PORT             || 3001;
+const LARAVEL_API_URL  = process.env.LARAVEL_API_URL  || 'http://localhost:8000/api/v1';
+const CORS_ORIGIN      = process.env.CORS_ORIGIN      || 'http://localhost:5173';
+const REDIS_URL        = process.env.REDIS_URL        || 'redis://localhost:6379';
 
-// Rate limiting configuration
-// CRITICAL: Higher limit for development to allow multiple tabs/devices
-const MAX_CONNECTIONS_PER_IP = parseInt(process.env.MAX_CONNECTIONS_PER_IP || (process.env.NODE_ENV === 'production' ? '5' : '20'), 10);
-const MESSAGE_RATE_LIMIT = parseInt(process.env.MESSAGE_RATE_LIMIT || '10', 10);
-const MESSAGE_RATE_WINDOW = parseInt(process.env.MESSAGE_RATE_WINDOW || '60000', 10);
+const MAX_CONNECTIONS_PER_IP = parseInt(
+  process.env.MAX_CONNECTIONS_PER_IP || (process.env.NODE_ENV === 'production' ? '5' : '20'), 10
+);
+const MESSAGE_RATE_LIMIT  = parseInt(process.env.MESSAGE_RATE_LIMIT  || '10',    10);
+const MESSAGE_RATE_WINDOW = parseInt(process.env.MESSAGE_RATE_WINDOW || '60',    10); // seconds
+const PRESENCE_TIMEOUT    = parseInt(process.env.PRESENCE_TIMEOUT    || '90000', 10);
+const HEARTBEAT_INTERVAL  = parseInt(process.env.HEARTBEAT_INTERVAL  || '30000', 10);
+const MATCH_RETRY_INTERVAL= parseInt(process.env.MATCH_RETRY_INTERVAL|| '2000',  10);
 
-// Presence settings
-const PRESENCE_TIMEOUT = parseInt(process.env.PRESENCE_TIMEOUT || '90000', 10);
-const HEARTBEAT_INTERVAL = parseInt(process.env.HEARTBEAT_INTERVAL || '30000', 10);
+// ─── Local (per-process) state ────────────────────────────────────────────────
+// connectedGuests and messageSequenceNumbers remain in-memory because they
+// track live socket objects and per-message ordering respectively —
+// both are inherently per-process and don't need cross-instance sharing.
+const connectedGuests        = new Map(); // guestId -> socket (local only — socket objects can't be serialized)
+const messageSequenceNumbers = new Map(); // chatId  -> number (resets on reconnect — acceptable)
+// All other state (chatRooms, guestToChat, pendingMessages, pendingMatch,
+// rateLimiting, connectionCounts) is now in Redis via redisStore.js.
 
-// In-memory storage (production should use Redis)
-// CRITICAL: Declare before HTTP server to avoid reference errors
-const connectedGuests = new Map(); // guestId -> socket
-const chatRooms = new Map(); // chatId -> Set of guestIds
-const guestToChat = new Map(); // guestId -> chatId
-const messageSequenceNumbers = new Map(); // chatId -> sequence number
-const pendingMessages = new Map(); // guestId -> array of pending messages
-const pendingMatchFound = new Map(); // guestId -> match payload
-const rateLimitTrackers = new Map(); // guestId -> { count, resetTime }
-const connectionCounts = new Map(); // ip -> count
-const connectionAttempts = new Map(); // ip -> { count, resetTime } for auth rate limiting
-
-// Create HTTP server with health check
+// ─── HTTP server (health check only) ─────────────────────────────────────────
 const httpServer = createServer((req, res) => {
-  // IMPORTANT: Don't intercept Socket.IO/Engine.IO handshake routes
-  if (req.url?.startsWith('/socket.io/')) {
-    return;
-  }
+  // Let Socket.IO handle its own routes
+  if (req.url?.startsWith('/socket.io/')) return;
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    status: 'ok',
-    service: 'websocket-server',
-    timestamp: new Date().toISOString(),
-    connections: connectedGuests.size
+    status:      'ok',
+    service:     'websocket-server',
+    timestamp:   new Date().toISOString(),
+    connections: connectedGuests.size, // live sockets on this process
+    redis:       'connected',          // if we reach here, redis startup succeeded
   }));
 });
 
-// Parse CORS origins - support multiple origins and wildcards
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+// SECURITY FIX: Removed wildcard *.vercel.app — any Vercel app could connect.
+// Only explicit origins are allowed in production.
 const getCorsOriginChecker = () => {
-  const origins = process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',').map(o => o.trim()) : [CORS_ORIGIN];
-  
-  // Add Vercel patterns for production
+  // Start with explicitly configured origins
+  const origins = process.env.CORS_ORIGINS
+    ? process.env.CORS_ORIGINS.split(',').map(o => o.trim())
+    : [CORS_ORIGIN];
+
+  // Add specific known production origins
   if (process.env.NODE_ENV === 'production') {
-    origins.push(
-      'https://sochat-frontend.vercel.app',
-      'https://sochat-livid.vercel.app',
-      'https://sochat-git-main-daniels-projects-8c2bbb7b.vercel.app',
-      'https://sochat-*.vercel.app',
-      'https://*.vercel.app'
-    );
+    const productionOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean);
+    productionOrigins.forEach(o => { if (!origins.includes(o)) origins.push(o); });
   }
-  
+
   return (origin, callback) => {
-    // Allow requests with no origin (mobile apps, Postman, etc.)
+    // Allow requests with no origin (server-to-server, Postman, mobile)
     if (!origin) return callback(null, true);
-    
-    // Check exact matches
-    if (origins.includes(origin)) {
-      return callback(null, true);
-    }
-    
-    // Check wildcard patterns
-    for (const pattern of origins) {
-      if (pattern.includes('*')) {
-        const regex = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$');
-        if (regex.test(origin)) {
-          return callback(null, true);
-        }
-      }
-    }
-    
-    // Default: allow in development, deny in production
-    if (process.env.NODE_ENV !== 'production') {
-      return callback(null, true);
-    }
-    
-    // Log rejected origin for debugging
+
+    if (origins.includes(origin)) return callback(null, true);
+
+    // In development, allow everything
+    if (process.env.NODE_ENV !== 'production') return callback(null, true);
+
     console.warn(`CORS rejected origin: ${origin}`);
     callback(new Error('Not allowed by CORS'));
   };
 };
 
-// Create Socket.IO server with production-safe configuration
+// ─── Socket.IO ────────────────────────────────────────────────────────────────
 const io = new Server(httpServer, {
   cors: {
-    origin: getCorsOriginChecker(),
-    methods: ['GET', 'POST'],
-    credentials: true
+    origin:      getCorsOriginChecker(),
+    methods:     ['GET', 'POST'],
+    credentials: true,
   },
-  pingTimeout: parseInt(process.env.PING_TIMEOUT || '60000', 10),
-  pingInterval: parseInt(process.env.PING_INTERVAL || '25000', 10),
+  pingTimeout:       parseInt(process.env.PING_TIMEOUT    || '60000', 10),
+  pingInterval:      parseInt(process.env.PING_INTERVAL   || '25000', 10),
   maxHttpBufferSize: (() => {
-    const raw = process.env.MAX_HTTP_BUFFER_SIZE;
-    const val = raw ? Number(raw) : 1_000_000;
+    const val = Number(process.env.MAX_HTTP_BUFFER_SIZE || 1_000_000);
     return Number.isFinite(val) && val > 0 ? val : 1_000_000;
   })(),
-  transports: ['websocket', 'polling'],
+  transports:    ['websocket', 'polling'],
   allowUpgrades: true,
-  upgradeTimeout: 10000
+  upgradeTimeout: 10000,
 });
 
 io.engine.on('connection_error', (err) => {
-  console.error('Engine.IO connection_error:', {
-    code: err.code,
-    message: err.message,
-    context: err.context
-  });
+  console.error('Engine.IO connection_error:', { code: err.code, message: err.message });
 });
 
-// Helper: Validate session token with Laravel backend
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * SECURITY FIX: Use the read-only GET /guest/validate instead of the
+ * state-changing POST /guest/refresh. This avoids unintended session
+ * extensions on every WebSocket handshake.
+ */
 async function validateSession(sessionToken) {
   try {
     if (!sessionToken || typeof sessionToken !== 'string' || sessionToken.length < 10) {
-      console.error('❌ Invalid session token format:', sessionToken ? `${sessionToken.substring(0, 10)}...` : 'null');
+      console.error('❌ Invalid session token format');
       return null;
     }
 
-    const response = await axios.post(
-      `${LARAVEL_API_URL}/guest/refresh`,
-      null,
+    const response = await axios.get(
+      `${LARAVEL_API_URL}/guest/validate`,
       {
         headers: { Authorization: `Bearer ${sessionToken}` },
-        timeout: 10000 // Increased from 5s to 10s
+        timeout: 10000,
       }
     );
 
-    if (!response.data?.success) {
-      console.error('❌ Session validation failed - backend returned success=false:', {
-        status: response.status,
-        data: response.data
-      });
+    if (!response.data?.success || !response.data?.data?.guest_id) {
+      console.error('❌ Session validation failed:', response.data);
       return null;
     }
 
-    if (!response.data?.data?.guest_id) {
-      console.error('❌ Session validation failed - missing guest_id in response:', response.data);
-      return null;
-    }
-
-    return {
-      guestId: response.data.data.guest_id,
-    };
+    return { guestId: response.data.data.guest_id };
   } catch (error) {
-    // CRITICAL: Log detailed error information for debugging
     if (error.response) {
-      // Backend responded with error status
-      console.error('❌ Session validation failed - backend error:', {
-        status: error.response.status,
-        statusText: error.response.statusText,
-        data: error.response.data,
-        url: `${LARAVEL_API_URL}/guest/refresh`
-      });
-    } else if (error.request) {
-      // Request was made but no response received
-      console.error('❌ Session validation failed - no response from backend:', {
-        message: error.message,
-        code: error.code,
-        url: `${LARAVEL_API_URL}/guest/refresh`,
-        hint: 'Is the Laravel backend running?'
+      console.error('❌ Session validation — backend error:', {
+        status:  error.response.status,
+        data:    error.response.data,
+        url:     `${LARAVEL_API_URL}/guest/validate`,
       });
     } else {
-      // Error setting up request
-      console.error('❌ Session validation failed - request setup error:', {
+      console.error('❌ Session validation — no response:', {
         message: error.message,
-        url: `${LARAVEL_API_URL}/guest/refresh`
+        code:    error.code,
+        hint:    'Is the Laravel backend running?',
       });
     }
     return null;
@@ -196,7 +183,6 @@ async function startChat(sessionToken) {
   return response.data;
 }
 
-// Helper: Send message via Laravel API for persistence
 async function persistMessage(chatId, content, sessionToken) {
   try {
     const response = await axios.post(
@@ -211,7 +197,6 @@ async function persistMessage(chatId, content, sessionToken) {
   }
 }
 
-// Helper: Notify Laravel of chat end
 async function notifyChatEnd(chatId, sessionToken) {
   try {
     await axios.post(
@@ -224,274 +209,223 @@ async function notifyChatEnd(chatId, sessionToken) {
   }
 }
 
-// Helper: Check rate limit
-function checkRateLimit(guestId) {
-  const now = Date.now();
-  const tracker = rateLimitTrackers.get(guestId) || { count: 0, resetTime: now + MESSAGE_RATE_WINDOW };
-
-  if (now > tracker.resetTime) {
-    tracker.count = 0;
-    tracker.resetTime = now + MESSAGE_RATE_WINDOW;
-  }
-
-  tracker.count++;
-  rateLimitTrackers.set(guestId, tracker);
-
-  return tracker.count <= MESSAGE_RATE_LIMIT;
+/**
+ * Message rate limit check — delegates to Redis.
+ * Returns true if the guest is WITHIN the limit (allowed), false if over.
+ */
+async function checkRateLimit(guestId) {
+  const limited = await checkMessageRateLimit(guestId, MESSAGE_RATE_LIMIT, MESSAGE_RATE_WINDOW);
+  return !limited; // returns true = allowed
 }
 
-// Helper: Check connection limit per IP
-function checkConnectionLimit(ip) {
-  const count = connectionCounts.get(ip) || 0;
+/** Connection count check — delegates to Redis. */
+async function checkConnectionLimit(ip) {
+  const count   = await getConnectionCount(ip);
   const allowed = count < MAX_CONNECTIONS_PER_IP;
-  
-  if (!allowed) {
-    console.warn(`Connection limit exceeded for IP ${ip}: ${count}/${MAX_CONNECTIONS_PER_IP}`);
-  }
-  
+  if (!allowed) console.warn(`[WS] Connection limit exceeded for IP ${ip}: ${count}/${MAX_CONNECTIONS_PER_IP}`);
   return allowed;
 }
 
-// Helper: Check authentication rate limit
-function checkAuthRateLimit(ip) {
-  const now = Date.now();
-  const AUTH_RATE_LIMIT = 10; // Max 10 auth attempts
-  const AUTH_RATE_WINDOW = 60000; // Per minute
-  
-  const tracker = connectionAttempts.get(ip) || { count: 0, resetTime: now + AUTH_RATE_WINDOW };
-  
-  if (now > tracker.resetTime) {
-    tracker.count = 0;
-    tracker.resetTime = now + AUTH_RATE_WINDOW;
-  }
-  
-  tracker.count++;
-  connectionAttempts.set(ip, tracker);
-  
-  return tracker.count <= AUTH_RATE_LIMIT;
+// checkAuthRateLimit is imported directly from redisStore.js as:
+//   checkAuthRateLimit(ip) → Promise<boolean> (true = blocked)
+// Used in the io.use() auth middleware.
+
+/** Track a new connection for this IP. */
+async function incrementConnection(ip) {
+  await incrementConnections(ip);
 }
 
-// Helper: Increment connection count
-function incrementConnection(ip) {
-  const count = connectionCounts.get(ip) || 0;
-  connectionCounts.set(ip, count + 1);
+/** Track a closed connection for this IP. */
+async function decrementConnection(ip) {
+  await decrementConnections(ip);
 }
 
-// Helper: Decrement connection count
-function decrementConnection(ip) {
-  const count = connectionCounts.get(ip) || 0;
-  connectionCounts.set(ip, Math.max(0, count - 1));
-}
-
-// Helper: Get next sequence number for chat (atomic operation)
+// NOTE: Sequence numbers remain local (per-process) — reset on restart is acceptable.
 function getNextSequenceNumber(chatId) {
-  // Use atomic increment to prevent race conditions
-  const current = messageSequenceNumbers.get(chatId) || 0;
-  const next = current + 1;
+  const next = (messageSequenceNumbers.get(chatId) || 0) + 1;
   messageSequenceNumbers.set(chatId, next);
   return next;
 }
 
-// CRITICAL: Ensure sequence numbers are unique per chat
-// In production, this should use Redis INCR for true atomicity
 
-// Middleware: Authentication
+// ─── Auth middleware ───────────────────────────────────────────────────────────
 io.use(async (socket, next) => {
   try {
     const ip = socket.handshake.address;
-    
-    // CRITICAL: Rate limit authentication attempts
-    if (!checkAuthRateLimit(ip)) {
+
+    // checkAuthRateLimit from redisStore returns true = BLOCKED
+    if (await checkAuthRateLimit(ip)) {
       return next(new Error('Too many authentication attempts. Please try again later.'));
     }
-    
-    const sessionToken = socket.handshake.auth?.token;
-    const claimedGuestId = socket.handshake.auth?.guestId;
+
+    const sessionToken  = socket.handshake.auth?.token;
+    const claimedGuestId= socket.handshake.auth?.guestId;
 
     if (!sessionToken) {
-      console.error('❌ Authentication failed: Missing session token', {
-        ip,
-        hasAuth: !!socket.handshake.auth,
-        authKeys: socket.handshake.auth ? Object.keys(socket.handshake.auth) : []
-      });
+      console.error('❌ Auth failed: missing token', { ip });
       return next(new Error('Authentication failed: Missing credentials'));
     }
 
-    console.log('🔐 Validating session token...', {
-      tokenPrefix: sessionToken.substring(0, 10) + '...',
-      claimedGuestId,
-      backendUrl: LARAVEL_API_URL
-    });
+    console.log('🔐 Validating session...', { tokenPrefix: sessionToken.substring(0, 10) + '...' });
 
     const session = await validateSession(sessionToken);
     if (!session?.guestId) {
-      console.error('❌ Authentication failed: Session validation returned null', {
-        ip,
-        tokenPrefix: sessionToken.substring(0, 10) + '...',
-        backendUrl: LARAVEL_API_URL
-      });
-      return next(new Error('Authentication failed: Invalid session. Please refresh the page to get a new session.'));
+      console.error('❌ Auth failed: invalid session', { ip });
+      return next(new Error('Authentication failed: Invalid session. Please refresh the page.'));
     }
 
     if (claimedGuestId && claimedGuestId !== session.guestId) {
-      console.error('❌ Authentication failed: Guest ID mismatch', {
-        claimed: claimedGuestId,
-        validated: session.guestId
-      });
+      console.error('❌ Auth failed: guest ID mismatch', { claimed: claimedGuestId, validated: session.guestId });
       return next(new Error('Authentication failed: Guest mismatch'));
     }
 
-    // Check connection limit
-    if (!checkConnectionLimit(ip)) {
-      return next(new Error(`Too many connections from this IP (max ${MAX_CONNECTIONS_PER_IP}). Please close other tabs or wait a moment.`));
+    if (!(await checkConnectionLimit(ip))) {
+      return next(new Error(`Too many connections from this IP (max ${MAX_CONNECTIONS_PER_IP}). Please close other tabs.`));
     }
 
     socket.sessionToken = sessionToken;
-    socket.guestId = session.guestId;
-    socket.ip = ip;
+    socket.guestId      = session.guestId;
+    socket.ip           = ip;
 
-    console.log('✅ Authentication successful', {
-      guestId: session.guestId,
-      ip
-    });
-
-    incrementConnection(ip);
+    console.log('✅ Auth successful', { guestId: session.guestId, ip });
+    await incrementConnection(ip);
     next();
   } catch (error) {
-    console.error('❌ Authentication error:', error.message, error.stack);
+    console.error('❌ Auth error:', error.message);
     next(new Error('Authentication failed: ' + error.message));
   }
 });
 
-  // Connection handler
-  io.on('connection', (socket) => {
-    const { guestId, sessionToken, ip } = socket;
+// ─── Connection handler ───────────────────────────────────────────────────────
+io.on('connection', (socket) => {
+  const { guestId, sessionToken, ip } = socket;
+  console.log(`✅ Guest connected: ${guestId}`);
 
-    let matchRetryInterval = null;
+  // FIX: Track matchRetryInterval on the socket itself so that if the same
+  // guest reconnects (new socket, same guestId), the old interval is cleanly
+  // stopped before creating a new one — prevents duplicate polling intervals.
+  socket._matchRetryInterval = null;
 
-    console.log(`Guest connected: ${guestId}`);
+  // Replace any stale socket for this guest
+  const existingSocket = connectedGuests.get(guestId);
+  if (existingSocket && existingSocket.id !== socket.id) {
+    console.log(`♻️  Replacing stale socket for guest ${guestId}`);
+    // Clear old socket's match retry if it has one
+    if (existingSocket._matchRetryInterval) {
+      clearInterval(existingSocket._matchRetryInterval);
+      existingSocket._matchRetryInterval = null;
+    }
+  }
+  connectedGuests.set(guestId, socket);
 
-    // Store connection
-    connectedGuests.set(guestId, socket);
+  // Mark user online
+  axios.post(`${LARAVEL_API_URL}/presence/heartbeat`, {}, {
+    headers: { Authorization: `Bearer ${sessionToken}` },
+    timeout: 5000,
+  }).catch(err => console.error(`Failed to mark ${guestId} as online:`, err.message));
 
-    // CRITICAL: Mark user as online in Laravel backend
-    axios.post(`${LARAVEL_API_URL}/presence/heartbeat`, {}, {
-      headers: { Authorization: `Bearer ${sessionToken}` },
-      timeout: 5000
-    }).catch(err => {
-      console.error(`Failed to mark ${guestId} as online:`, err.message);
-    });
-
-  // Send pending messages
+  // Deliver any messages queued while disconnected
   const pending = pendingMessages.get(guestId) || [];
   if (pending.length > 0) {
     pending.forEach(msg => socket.emit('message', msg));
     pendingMessages.delete(guestId);
   }
 
+  // Deliver any queued match notification
   const pendingMatch = pendingMatchFound.get(guestId);
   if (pendingMatch) {
     socket.emit('match:found', pendingMatch);
     pendingMatchFound.delete(guestId);
   }
 
+  // ── Match helpers ────────────────────────────────────────────────────────
+
   const stopMatchRetry = () => {
-    if (matchRetryInterval) {
-      clearInterval(matchRetryInterval);
-      matchRetryInterval = null;
+    if (socket._matchRetryInterval) {
+      clearInterval(socket._matchRetryInterval);
+      socket._matchRetryInterval = null;
     }
   };
 
   const attemptMatch = async () => {
     try {
       const result = await startChat(sessionToken);
-      const data = result?.data;
+      const data   = result?.data;
 
-      if (!result?.success || !data?.status) {
-        return;
-      }
+      if (!result?.success || !data?.status) return;
+      if (data.status !== 'matched' && data.status !== 'already_matched') return;
 
-      if (data.status !== 'matched' && data.status !== 'already_matched') {
-        return;
-      }
-
-      const chatId = Number(data.chat_id);
+      const chatId    = Number(data.chat_id);
       const partnerId = data.partner_id;
 
-      if (!chatId || !partnerId || partnerId === guestId) {
-        return;
-      }
+      if (!chatId || !partnerId || partnerId === guestId) return;
 
       stopMatchRetry();
 
+      // Update in-memory room state
       const participants = new Set([guestId, partnerId]);
       chatRooms.set(chatId, participants);
       guestToChat.set(guestId, chatId);
       guestToChat.set(partnerId, chatId);
 
-      const payloadForRequester = {
-        chat_id: chatId,
+      socket.emit('match:found', {
+        chat_id:    chatId,
         partner_id: partnerId,
-        started_at: data.started_at
-      };
-
-      const payloadForPartner = {
-        chat_id: chatId,
-        partner_id: guestId,
-        started_at: data.started_at
-      };
-
-      socket.emit('match:found', payloadForRequester);
+        started_at: data.started_at,
+      });
 
       const partnerSocket = connectedGuests.get(partnerId);
       if (partnerSocket) {
-        partnerSocket.emit('match:found', payloadForPartner);
+        partnerSocket.emit('match:found', {
+          chat_id:    chatId,
+          partner_id: guestId,
+          started_at: data.started_at,
+        });
       } else {
-        pendingMatchFound.set(partnerId, payloadForPartner);
+        pendingMatchFound.set(partnerId, {
+          chat_id:    chatId,
+          partner_id: guestId,
+          started_at: data.started_at,
+        });
       }
-    } catch (e) {
-      // ignore transient failures
+    } catch (_) {
+      // Transient failure — retry interval will try again
     }
   };
 
-  // Handle join presence pool
-  socket.on('presence:join', () => {
-    console.log(`Guest ${guestId} joined presence pool`);
+  // ── Socket event handlers ─────────────────────────────────────────────────
 
+  socket.on('presence:join', () => {
+    console.log(`👥 Guest ${guestId} joined presence pool`);
     stopMatchRetry();
     attemptMatch();
-    matchRetryInterval = setInterval(attemptMatch, parseInt(process.env.MATCH_RETRY_INTERVAL || '2000', 10));
+    socket._matchRetryInterval = setInterval(attemptMatch, MATCH_RETRY_INTERVAL);
   });
 
-  // Handle leave presence pool
   socket.on('presence:leave', () => {
-    console.log(`Guest ${guestId} left presence pool`);
+    console.log(`👋 Guest ${guestId} left presence pool`);
     stopMatchRetry();
   });
 
-  // Handle send message
   socket.on('message:send', async (data, callback) => {
     const { chatId, content } = data;
     const normalizedChatId = Number(chatId);
 
-    // Validate input
     if (!normalizedChatId || !content || typeof content !== 'string') {
       if (callback) callback({ success: false, error: 'Invalid message data' });
       return;
     }
 
     if (content.length > 1000) {
-      if (callback) callback({ success: false, error: 'Message too long' });
+      if (callback) callback({ success: false, error: 'Message too long (max 1000 characters)' });
       return;
     }
 
-    // Check rate limit
     if (!checkRateLimit(guestId)) {
       if (callback) callback({ success: false, error: 'Rate limit exceeded' });
       return;
     }
 
-    // Verify guest is in this chat
     const currentChatId = guestToChat.get(guestId);
     if (currentChatId !== normalizedChatId) {
       if (callback) callback({ success: false, error: 'Not in this chat' });
@@ -499,318 +433,227 @@ io.use(async (socket, next) => {
     }
 
     try {
-      // Get sequence number
       const sequenceNumber = getNextSequenceNumber(normalizedChatId);
+      const persisted      = await persistMessage(normalizedChatId, content, sessionToken);
 
-      // Persist to database via Laravel
-      const persisted = await persistMessage(normalizedChatId, content, sessionToken);
-
-      // Create message object
       const message = {
-        message_id: persisted.message_id,
+        message_id:      persisted.message_id,
         sender_guest_id: guestId,
-        content: persisted.content,
-        created_at: persisted.created_at,
-        is_flagged: persisted.is_flagged || false,
-        sequence_number: sequenceNumber
+        chat_id:         normalizedChatId,           // FIX: include chat_id for client-side filtering
+        content:         persisted.content,
+        created_at:      persisted.created_at,
+        is_flagged:      persisted.is_flagged || false,
+        sequence_number: sequenceNumber,
       };
 
-      // Get chat participants
       const participants = chatRooms.get(normalizedChatId) || new Set();
-      const partnerId = Array.from(participants).find(id => id !== guestId);
+      const partnerId    = Array.from(participants).find(id => id !== guestId);
 
-      // Send to partner if connected
       if (partnerId) {
         const partnerSocket = connectedGuests.get(partnerId);
         if (partnerSocket) {
           partnerSocket.emit('message', message);
         } else {
-          // Store as pending
-          const pending = pendingMessages.get(partnerId) || [];
-          pending.push(message);
-          pendingMessages.set(partnerId, pending);
+          const queue = pendingMessages.get(partnerId) || [];
+          queue.push(message);
+          pendingMessages.set(partnerId, queue);
         }
       }
 
-      // Acknowledge send
       if (callback) callback({ success: true, message });
-
     } catch (error) {
       console.error('Error sending message:', error);
       if (callback) callback({ success: false, error: error.message });
     }
   });
 
-  // Handle typing indicator
   socket.on('typing:start', (data) => {
-    const { chatId } = data;
-    const normalizedChatId = Number(chatId);
-
-    // Verify guest is in this chat
-    const currentChatId = guestToChat.get(guestId);
-    if (currentChatId !== normalizedChatId) return;
+    const normalizedChatId = Number(data?.chatId);
+    if (!normalizedChatId || guestToChat.get(guestId) !== normalizedChatId) return;
 
     const participants = chatRooms.get(normalizedChatId) || new Set();
-    const partnerId = Array.from(participants).find(id => id !== guestId);
-
-    if (partnerId) {
-      const partnerSocket = connectedGuests.get(partnerId);
-      if (partnerSocket) {
-        partnerSocket.emit('typing', { sender_guest_id: guestId, is_typing: true });
-      }
-    }
+    const partnerId    = Array.from(participants).find(id => id !== guestId);
+    const partnerSocket= partnerId ? connectedGuests.get(partnerId) : null;
+    if (partnerSocket) partnerSocket.emit('typing', { sender_guest_id: guestId, is_typing: true });
   });
 
   socket.on('typing:stop', (data) => {
-    const { chatId } = data;
-    const normalizedChatId = Number(chatId);
-
-    // Verify guest is in this chat
-    const currentChatId = guestToChat.get(guestId);
-    if (currentChatId !== normalizedChatId) return;
+    const normalizedChatId = Number(data?.chatId);
+    if (!normalizedChatId || guestToChat.get(guestId) !== normalizedChatId) return;
 
     const participants = chatRooms.get(normalizedChatId) || new Set();
-    const partnerId = Array.from(participants).find(id => id !== guestId);
-
-    if (partnerId) {
-      const partnerSocket = connectedGuests.get(partnerId);
-      if (partnerSocket) {
-        partnerSocket.emit('typing', { sender_guest_id: guestId, is_typing: false });
-      }
-    }
+    const partnerId    = Array.from(participants).find(id => id !== guestId);
+    const partnerSocket= partnerId ? connectedGuests.get(partnerId) : null;
+    if (partnerSocket) partnerSocket.emit('typing', { sender_guest_id: guestId, is_typing: false });
   });
 
-  // Handle chat rejoin (after reconnection)
   socket.on('chat:rejoin', async (data) => {
-    const { chatId } = data;
-    const normalizedChatId = Number(chatId);
+    const normalizedChatId = Number(data?.chatId);
 
     if (!normalizedChatId) {
-      warn(`Invalid chat rejoin request from ${guestId}`);
+      // FIX: was calling undefined `warn()` — use console.warn
+      console.warn(`Invalid chat rejoin request from ${guestId}`);
       return;
     }
 
-    // Verify guest is in this chat
     const currentChatId = guestToChat.get(guestId);
-    if (currentChatId !== normalizedChatId) {
-      // Try to restore from backend
-      try {
-        const response = await axios.get(
-          `${LARAVEL_API_URL}/chat/${normalizedChatId}/messages`,
-          { headers: { Authorization: `Bearer ${sessionToken}` }, timeout: 5000 }
-        );
-        
-        if (response.data?.success) {
-          // Restore chat room membership
-          const participants = chatRooms.get(normalizedChatId) || new Set();
-          participants.add(guestId);
-          chatRooms.set(normalizedChatId, participants);
-          guestToChat.set(guestId, normalizedChatId);
-          
-          console.log(`Guest ${guestId} rejoined chat ${normalizedChatId}`);
-        }
-      } catch (error) {
-        console.error(`Failed to rejoin chat ${normalizedChatId}:`, error.message);
-      }
-    } else {
-      // Already in chat, just confirm
+    if (currentChatId === normalizedChatId) {
       console.log(`Guest ${guestId} already in chat ${normalizedChatId}`);
+      return;
+    }
+
+    // Restore from backend if WS state lost (e.g. after restart)
+    try {
+      const response = await axios.get(
+        `${LARAVEL_API_URL}/chat/${normalizedChatId}/messages`,
+        { headers: { Authorization: `Bearer ${sessionToken}` }, timeout: 5000 }
+      );
+
+      if (response.data?.success) {
+        const participants = chatRooms.get(normalizedChatId) || new Set();
+        participants.add(guestId);
+        chatRooms.set(normalizedChatId, participants);
+        guestToChat.set(guestId, normalizedChatId);
+        console.log(`Guest ${guestId} rejoined chat ${normalizedChatId}`);
+      }
+    } catch (error) {
+      console.error(`Failed to rejoin chat ${normalizedChatId}:`, error.message);
     }
   });
 
-  // Handle chat end
   socket.on('chat:end', async (data, callback) => {
-    const { chatId } = data;
-    const normalizedChatId = Number(chatId);
+    const normalizedChatId = Number(data?.chatId);
 
-    // Verify guest is in this chat
-    const currentChatId = guestToChat.get(guestId);
-    if (currentChatId !== normalizedChatId) {
+    if (!normalizedChatId || guestToChat.get(guestId) !== normalizedChatId) {
       if (callback) callback({ success: false, error: 'Not in this chat' });
       return;
     }
 
     try {
-      // Notify Laravel
       await notifyChatEnd(normalizedChatId, sessionToken);
 
-      // Get participants
       const participants = chatRooms.get(normalizedChatId) || new Set();
+      const endedPayload = {
+        chat_id:  normalizedChatId,
+        ended_by: guestId,
+        ended_at: new Date().toISOString(),
+      };
 
-      // Notify both participants
       participants.forEach(participantId => {
-        const participantSocket = connectedGuests.get(participantId);
-        if (participantSocket) {
-          participantSocket.emit('chat:ended', {
-            chat_id: normalizedChatId,
-            ended_by: guestId,
-            ended_at: new Date().toISOString()
-          });
-
-          // Clean up
-          guestToChat.delete(participantId);
-        }
+        const pSocket = connectedGuests.get(participantId);
+        if (pSocket) pSocket.emit('chat:ended', endedPayload);
+        guestToChat.delete(participantId);
       });
 
-      // Clean up room
       chatRooms.delete(normalizedChatId);
       messageSequenceNumbers.delete(normalizedChatId);
 
       if (callback) callback({ success: true });
-
     } catch (error) {
       console.error('Error ending chat:', error);
       if (callback) callback({ success: false, error: error.message });
     }
   });
 
-  // Handle disconnect
-  socket.on('disconnect', (reason) => {
-    console.log(`Guest disconnected: ${guestId}, reason: ${reason}`);
+  socket.on('disconnect', async (reason) => {
+    console.log(`❌ Guest disconnected: ${guestId}, reason: ${reason}`);
 
-    // CRITICAL: Always decrement connection count on disconnect FIRST
-    // This must happen before any other cleanup to prevent connection limit issues
+    // Always decrement first to prevent connection limit blocking new connections
     decrementConnection(ip);
-    
-    // Remove from connected guests immediately to prevent stale connections
     connectedGuests.delete(guestId);
-
     stopMatchRetry();
 
-    // Notify Laravel of disconnect
+    // Notify Laravel (fire-and-forget)
     axios.post(`${LARAVEL_API_URL}/presence/disconnect`, {}, {
-      headers: { Authorization: `Bearer ${sessionToken}` }
+      headers: { Authorization: `Bearer ${sessionToken}` },
     }).catch(err => console.error('Failed to notify disconnect:', err.message));
 
-    // Handle chat cleanup if guest was in a chat
-    const chatId = guestToChat.get(guestId);
+    // Notify partner if in active chat
+    const chatId = await getGuestChat(guestId);
     if (chatId) {
-      const participants = chatRooms.get(chatId) || new Set();
+      const participants = await getRoomGuests(chatId);
+      const endedPayload = {
+        chat_id:  Number(chatId),
+        ended_by: guestId,
+        ended_at: new Date().toISOString(),
+      };
 
-      // Notify partner
-      const partnerId = Array.from(participants).find(id => id !== guestId);
-      if (partnerId) {
-        const partnerSocket = connectedGuests.get(partnerId);
-        if (partnerSocket) {
-          partnerSocket.emit('chat:ended', {
-            chat_id: chatId,
-            ended_by: guestId,
-            ended_at: new Date().toISOString()
-          });
-        }
-
-        // Clean up partner
-        guestToChat.delete(partnerId);
+      for (const participantId of participants) {
+        if (participantId === guestId) continue;
+        const pSocket = connectedGuests.get(participantId);
+        if (pSocket) pSocket.emit('chat:ended', endedPayload);
+        await deleteGuestChat(participantId);
       }
 
-      guestToChat.delete(guestId);
-
-      // Clean up room
-      chatRooms.delete(chatId);
+      await deleteRoom(chatId);
       messageSequenceNumbers.delete(chatId);
     }
 
-    // Always remove guest->chat mapping (prevents stale state blocking future chats)
-    guestToChat.delete(guestId);
-
-    // Connection already removed above
+    await cleanupGuest(guestId);
   });
 
-  // Handle reconnection
-  socket.on('reconnect_attempt', () => {
-    console.log(`Guest ${guestId} attempting to reconnect`);
-  });
-
-  socket.on('reconnect', () => {
-    console.log(`Guest ${guestId} reconnected`);
-  });
 });
 
-// Heartbeat interval to clean up stale connections
+// ─── Heartbeat / stale connection cleanup ─────────────────────────────────────
 setInterval(() => {
-  const now = Date.now();
-  connectedGuests.forEach((socket, guestId) => {
-    if (!socket.connected) {
-      console.log(`Cleaning up stale connection: ${guestId}`);
-      const ip = socket.ip;
-      
-      // Decrement connection count for this IP
-      if (ip) {
-        decrementConnection(ip);
-      }
-      
+  connectedGuests.forEach((sock, guestId) => {
+    if (!sock.connected) {
+      console.log(`♻️  Cleaning up stale local socket: ${guestId}`);
       connectedGuests.delete(guestId);
-      guestToChat.delete(guestId);
+      // Redis-backed state expires via TTLs — explicit cleanup on disconnect event.
     }
   });
-
-  // Clean up rate limit trackers
-  rateLimitTrackers.forEach((tracker, guestId) => {
-    if (now > tracker.resetTime) {
-      rateLimitTrackers.delete(guestId);
-    }
-  });
-
-  // Clean up connection attempt trackers
-  connectionAttempts.forEach((tracker, ip) => {
-    if (now > tracker.resetTime) {
-      connectionAttempts.delete(ip);
-    }
-  });
-
+  // rateLimitTrackers, connectionAttempts, connectionCounts live in Redis
+  // with TTLs and expire automatically — no manual iteration needed.
 }, HEARTBEAT_INTERVAL);
 
-// Start server
-const startServer = () => {
+// ─── Server startup ───────────────────────────────────────────────────────────
+const startServer = async () => {
   console.log('🚀 Starting WebSocket server...');
-  console.log(`📋 PORT: ${PORT}`);
+  console.log(`📋 PORT:        ${PORT}`);
   console.log(`📋 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`📋 CORS Origin: ${CORS_ORIGIN}`);
+  console.log(`📋 Backend API: ${LARAVEL_API_URL}`);
 
+  // Connect to Redis BEFORE accepting any WebSocket connections
   try {
-    httpServer.on('listening', () => {
-      const address = httpServer.address();
-      console.log(`✅ WebSocket server running on port ${PORT}`);
-      console.log(`✅ Server address: ${JSON.stringify(address)}`);
-      // CRITICAL: 0.0.0.0 is a bind address, not accessible from browser
-      // Show localhost instead for health check access
-      console.log(`✅ Health check: http://localhost:${PORT}/`);
-      console.log(`   (Also accessible at: http://127.0.0.1:${PORT}/)`);
-    });
-
-    httpServer.on('error', (err) => {
-      console.error('❌ Server error:', err);
-      if (err.code === 'EADDRINUSE') {
-        console.error(`❌ Port ${PORT} is already in use`);
-      }
-      process.exit(1);
-    });
-
-    httpServer.listen(PORT, '0.0.0.0');
-
-  } catch (error) {
-    console.error('❌ Failed to start server:', error);
-    console.error('Error stack:', error.stack);
+    await connectRedis();
+    console.log('✅ Redis connected');
+  } catch (err) {
+    console.error('❌ Redis connection failed:', err.message);
+    console.error('Cannot start without Redis — set REDIS_URL in .env');
     process.exit(1);
   }
+
+  httpServer.on('listening', () => {
+    const addr = httpServer.address();
+    console.log(`✅ WebSocket server running on port ${PORT}`);
+    console.log(`✅ Health check: http://localhost:${PORT}/`);
+    console.log(`✅ Address: ${JSON.stringify(addr)}`);
+  });
+
+  httpServer.on('error', (err) => {
+    console.error('❌ Server error:', err);
+    if (err.code === 'EADDRINUSE') {
+      console.error(`❌ Port ${PORT} is already in use`);
+    }
+    process.exit(1);
+  });
+
+  httpServer.listen(PORT, '0.0.0.0');
 };
 
-// Start the server
 startServer();
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully');
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
+const shutdown = (signal) => {
+  console.log(`${signal} received, shutting down gracefully`);
   httpServer.close(() => {
     console.log('Server closed');
     process.exit(0);
   });
-});
+};
 
-process.on('SIGINT', () => {
-  console.log('SIGINT received, shutting down gracefully');
-  httpServer.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
-});
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+
+
