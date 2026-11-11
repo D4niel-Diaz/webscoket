@@ -1,141 +1,70 @@
 # Sorsu Talk WebSocket Server
 
-Dedicated WebSocket server for real-time chat functionality.
-
-## Features
-
-- **Message Sequencing**: Every message has a sequence number for guaranteed ordering
-- **Delivery Guarantees**: Acknowledgment system ensures messages are delivered
-- **Room Management**: Efficient room-based chat architecture
-- **Presence Tracking**: Real-time presence and matching system
-- **Rate Limiting**: Per-IP and per-guest rate limiting
-- **Automatic Reconnection**: Handles connection drops gracefully
-- **Message Deduplication**: Prevents duplicate messages
-- **State Synchronization**: Proper state sync after reconnection
-
-## Architecture
+Socket.IO server that sits between the browser and the Laravel API. It validates guest
+sessions against Laravel, matches waiting guests (by retrying `POST /chat/start`), relays
+messages and typing, and ends chats. Laravel stays the source of truth: messages are
+persisted through `POST /chat/message` before they are delivered.
 
 ```
-Frontend (Next.js on Vercel)
-    ↓ Socket.IO Client
-WebSocket Server (Node.js + Socket.IO)
-    ↓ REST API
-Laravel Backend (REST + Auth + Persistence)
+Frontend (React, Vercel) ──Socket.IO──▶ this server ──REST──▶ Laravel API (Postgres)
+                                             │
+                                           Redis (room state, queues, rate limits)
 ```
 
-## Installation
+## Requirements
+
+- Node.js 18+
+- Redis 2.6.12 or newer
+- The Laravel API running and reachable at `LARAVEL_API_URL`
+
+## Running
 
 ```bash
-cd websocket-server
 npm install
+cp .env.example .env
+npm run dev      # watch mode
+npm start        # production
+```
+
+## Tests
+
+```bash
+npm test         # syntax check + Redis store unit tests (uses Redis db 15; skips if Redis is down)
+npm run smoke    # end-to-end: needs the API (API_BASE) and this server (WS_URL) running
 ```
 
 ## Configuration
 
-Copy `.env.example` to `.env` and configure:
+See `.env.example`. The important ones:
 
-```env
-PORT=3001
-LARAVEL_API_URL=http://localhost:8000/api/v1
-CORS_ORIGIN=http://localhost:5173
-```
+| Variable | Default | Notes |
+|---|---|---|
+| `LARAVEL_API_URL` | `http://localhost:8000/api/v1` | |
+| `REDIS_URL` | `redis://localhost:6379` | |
+| `CORS_ORIGINS` | `CORS_ORIGIN` | Comma-separated exact origins (enforced in production) |
+| `TRUST_PROXY` | `false` | Set `true` on Render so limits use the client IP |
+| `MAX_CONNECTIONS_PER_IP` | 200 (prod) / 50 | Generous: campus users share public IPs |
+| `MAX_AUTH_FAILURES` | 30 | Failed handshakes per IP per minute |
+| `MESSAGE_RATE_LIMIT` / `MESSAGE_RATE_WINDOW` | 10 / 60 | Messages per guest per window (**seconds**) |
+| `DISCONNECT_GRACE_MS` | 15000 | How long a dropped guest may reconnect before the chat ends |
 
-## Running
+## Socket.IO events
 
-**Development:**
-```bash
-npm run dev
-```
+Client → server: `presence:join`, `presence:leave`, `message:send` (ack), `typing:start`,
+`typing:stop`, `chat:rejoin` (ack), `chat:end` (ack).
 
-**Production:**
-```bash
-npm start
-```
+Server → client: `match:found`, `message`, `typing`, `chat:ended`.
 
-## Socket.IO Events
+Message payload: `{ message_id, chat_id, sender_guest_id, content, created_at, is_flagged }`.
+Clients dedupe by `message_id`.
 
-### Client → Server
+## Disconnects
 
-- `presence:join` - Join the matching pool
-- `presence:leave` - Leave the matching pool
-- `message:send` - Send a message (with ack)
-- `typing:start` - Start typing indicator
-- `typing:stop` - Stop typing indicator
-- `chat:end` - End the chat (with ack)
-
-### Server → Client
-
-- `match:found` - Matched with a partner
-- `message` - Receive a message
-- `typing` - Typing indicator
-- `chat:ended` - Chat ended
-
-## Message Format
-
-### Message Object
-```json
-{
-  "message_id": 1,
-  "sender_guest_id": "uuid",
-  "content": "Hello",
-  "created_at": "2024-01-01T00:00:00Z",
-  "is_flagged": false,
-  "sequence_number": 1
-}
-```
-
-## Rate Limiting
-
-- **Per IP**: 5 connections max
-- **Per Guest**: 10 messages per 60 seconds
-- Configurable via environment variables
-
-## Production Deployment
-
-### Recommended Platforms
-
-1. **Railway** - Best for Node.js WebSocket servers
-2. **Render** - Good alternative with WebSocket support
-3. **Fly.io** - Global edge deployment
-
-### Example Railway Deployment
-
-```bash
-railway up
-```
-
-### Environment Variables for Production
-
-```env
-PORT=3001
-NODE_ENV=production
-LARAVEL_API_URL=https://your-laravel-api.com/api/v1
-CORS_ORIGIN=https://your-frontend.com
-```
-
-## Monitoring
-
-The server logs:
-- Connection events
-- Matching events
-- Message delivery
-- Errors and warnings
-
-## Security
-
-- Session token validation via Laravel backend
-- IP-based connection limiting
-- Rate limiting on messages
-- CORS protection
-- Input validation
+A dropped socket keeps its chat for `DISCONNECT_GRACE_MS`. Messages sent meanwhile are queued
+and delivered on reconnect. If the guest does not return, the chat is ended in Laravel and the
+partner receives `chat:ended`.
 
 ## Scaling
 
-For production, consider:
-- Using Redis for shared state across multiple instances
-- Load balancing with sticky sessions
-- Horizontal scaling for high traffic
-
-## License
-
-Proprietary - Campus Use Only
+Live sockets are tracked in-process, so run **one instance**. To scale out, add the
+Socket.IO Redis adapter and route partner delivery through rooms.
